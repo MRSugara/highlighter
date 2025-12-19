@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Analysis Result</h1>
+
+  {% if error %}
+    <div class="alert error">Error: {{ error }}</div>
+  {% endif %}
+
+  {% if video_id %}
+    <section class="card">
+      <h3>Video Preview</h3>
+      <div class="embed">
+        <iframe
+          src="https://www.youtube.com/embed/{{ video_id }}"
+          title="YouTube video"
+          frameborder="0"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+          allowfullscreen>
+        </iframe>
+      </div>
+    </section>
+  {% endif %}
+
+  {% if logs %}
+    <section class="card">
+      <h3>Analysis Log</h3>
+      <ul class="logs">
+        {% for line in logs %}
+          <li>{{ line }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+
+  {% if highlights %}
+    <section class="card">
+      <h3>Highlights</h3>
+      <ul class="highlights">
+        {% for h in highlights %}
+          <li>
+            <div>
+              <strong>{{ h.start|round(1) }}s → {{ h.end|round(1) }}s</strong>
+              {% if h.score %}
+                <span class="badge">Score: {{ h.score|round(2) }}</span>
+              {% endif %}
+            </div>
+            {% if h.category %}
+              <div class="muted">Category: {{ h.category }}</div>
+            {% endif %}
+            {% if h.reason %}
+              <div>{{ h.reason }}</div>
+            {% endif %}
+            {% if h.transcript %}
+              <blockquote>{{ h.transcript }}</blockquote>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+{% endblock %}

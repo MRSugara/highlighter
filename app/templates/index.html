@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>YouTube AI Highlighter</h1>
+
+  {% if error %}
+    <div class="alert error">{{ error }}</div>
+  {% endif %}
+
+  <form method="post" action="/analyze" class="card">
+    <label for="youtube_url">YouTube URL</label>
+    <input id="youtube_url" name="youtube_url" placeholder="https://www.youtube.com/watch?v=..." required>
+    <button type="submit">Analyze</button>
+  </form>
+
+  <section class="card" id="live-sections" style="display:none;">
+    <h3>Live Analysis</h3>
+    <div id="live-log">
+      <ul class="logs" id="logs-list"></ul>
+    </div>
+    <div id="live-output" style="margin-top:1rem;"></div>
+  </section>
+{% endblock %}

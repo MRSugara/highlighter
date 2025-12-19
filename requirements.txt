@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+jinja2
+sqlalchemy>=2.0
+aiomysql>=0.2.0
+python-multipart
+youtube-transcript-api>=0.6.2
+yt-dlp
+faster-whisper
+ffmpeg-python

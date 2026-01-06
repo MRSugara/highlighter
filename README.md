@@ -36,13 +36,15 @@ set DATABASE_URL=mysql+aiomysql://root:@127.0.0.1:3306/ai_highlighter
 3. Install dependencies and run migrations:
 
 ```bash
-python -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip
-.\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python app\database\migrate.py
+python -m venv .venv 
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+.\.venv\Scripts\python -m pip install --upgrade pip #pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -r requirements.txt #pip install -r requirements.txt
+.\.venv\Scripts\python app\database\migrate.py #python3 app/database/migrate.py 
+#pip install greenlet
 
-winget install OpenJS.NodeJS.LTS
-winget install Gyan.FFmpeg
+winget install OpenJS.NodeJS.LTS #brew install node
+winget install Gyan.FFmpeg #brew install ffmpeg
 
 ```
 

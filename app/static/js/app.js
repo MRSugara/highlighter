@@ -55,6 +55,17 @@ document.addEventListener('DOMContentLoaded',()=>{
             const t=document.createElement('div');
             t.innerHTML=`<strong>${x.start.toFixed(1)}s → ${x.end.toFixed(1)}s</strong> <span class="badge">Score: ${Number(x.score).toFixed(2)}</span>`;
             li.appendChild(t);
+
+            if(data.video_id){
+              const startSec=Math.max(0, Math.floor(Number(x.start)||0));
+              const endSec=Math.max(startSec+2, Math.ceil(Number(x.end)||0));
+              const embed=document.createElement('div');
+              embed.className='embed';
+              embed.style.margin='.75rem 0';
+              embed.innerHTML=`<iframe src="https://www.youtube.com/embed/${data.video_id}?start=${startSec}&end=${endSec}" title="Highlight at ${x.start.toFixed(1)}s" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>`;
+              li.appendChild(embed);
+            }
+
             if(x.category){
               const m=document.createElement('div');
               m.className='muted';

@@ -44,6 +44,19 @@
                 <span class="badge">Score: {{ h.score|round(2) }}</span>
               {% endif %}
             </div>
+
+            {% if video_id %}
+              <div class="embed" style="margin: .75rem 0;">
+                <iframe
+                  src="https://www.youtube.com/embed/{{ video_id }}?start={{ h.start|int }}&end={{ h.end|int + 1 }}"
+                  title="Highlight at {{ h.start|round(1) }}s"
+                  frameborder="0"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                  allowfullscreen>
+                </iframe>
+              </div>
+            {% endif %}
+
             {% if h.category %}
               <div class="muted">Category: {{ h.category }}</div>
             {% endif %}

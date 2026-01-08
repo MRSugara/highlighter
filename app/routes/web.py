@@ -50,10 +50,12 @@ async def analyze(
             await save_transcript(session, video_id, transcript)
             logs.append("Transcript saved to DB.")
 
-            # Detect highlights heuristically
-            logs.append("Detecting highlight candidates (heuristics)...")
+            # Detect highlights via Gemini
+            logs.append("Detecting highlight candidates (Gemini)...")
             highlights = detect_highlights(transcript)
             logs.append(f"Highlights detected: {len(highlights)} candidates")
+            if len(highlights) == 0:
+                logs.append("Gemini returned 0 valid highlights. For debugging, set HIGHLIGHT_DEBUG=1 and check server logs.")
         except Exception as exc:
             error = str(exc)
             logs.append(f"Analysis failed: {error}")
@@ -98,9 +100,11 @@ async def analyze_api(
             await save_transcript(session, video_id, transcript)
             logs.append("Transcript saved to DB.")
 
-            logs.append("Detecting highlight candidates (heuristics)...")
+            logs.append("Detecting highlight candidates (Gemini)...")
             highlights = detect_highlights(transcript)
             logs.append(f"Highlights detected: {len(highlights)} candidates")
+            if len(highlights) == 0:
+                logs.append("Gemini returned 0 valid highlights. For debugging, set HIGHLIGHT_DEBUG=1 and check server logs.")
         except Exception as exc:
             error = str(exc)
             logs.append(f"Analysis failed: {error}")
@@ -142,9 +146,11 @@ async def analyze_stream(
             yield _sse("log", "Transcript saved to DB.")
 
             # Detect highlights
-            yield _sse("log", "Detecting highlight candidates (heuristics)...")
+            yield _sse("log", "Detecting highlight candidates (Gemini)...")
             highlights = detect_highlights(transcript)
             yield _sse("log", f"Highlights detected: {len(highlights)} candidates")
+            if len(highlights) == 0:
+                yield _sse("log", "Gemini returned 0 valid highlights. For debugging, set HIGHLIGHT_DEBUG=1 and check server logs.")
 
             result = {
                 "video_id": video_id,

@@ -1,876 +1,332 @@
+"""app.services.highlight_ai
+
+Gemini-based highlight selection for short-form video.
+
+This module intentionally does NOT implement local heuristic scoring.
+It delegates highlight judgment to Google Gemini in a single request.
+
+Input transcript format (chronological, already segmented):
+[
+  {"start": float, "duration": float, "text": str},
+  ...
+]
+
+Output format:
+[
+  {"start": float, "end": float, "reason": str},
+  ...
+]
+
+Environment variables:
+- GEMINI_API_KEY (or GOOGLE_API_KEY): required
+- GEMINI_MODEL: optional (default: gemini-1.5-flash)
+- HIGHLIGHT_DEBUG=1: optional, logs Gemini/JSON issues to stderr
 """
-Context:
-- This module analyzes YouTube transcript segments
-- Transcript input format:
-  [
-    { "start": float, "duration": float, "text": str }
-  ]
 
-Task:
-- Implement a highlight detection function WITHOUT using any AI API
-- Use heuristic-based scoring
-
-Highlight definition:
-- A highlight is a segment that:
-  - Can stand alone
-  - Contains strong statement, insight, advice, or emotion
-  - Is suitable for short-form content
-
-Scoring rules (example, feel free to adjust):
-- +2 if sentence length between 8–25 words
-- +2 if contains strong keywords (e.g. "penting", "kunci", "masalah", "harus")
-- +2 if starts with emphasis words (e.g. "jadi", "intinya", "yang paling")
-- +1 if contains first-person insight ("saya", "kita")
-- -2 if sentence is a question
-- -3 if too short (<5 words) or too long (>30 words)
-
-Output:
-- List of highlight candidates
-- Each highlight must include:
-  - start
-  - end
-  - score
-  - category (e.g. insight, motivational, explanation)
-  - reason (short explanation)
-
-Rules:
-- Do NOT modify original transcript
-- Do NOT use external libraries
-- Keep code readable and testable
-"""
+import json
+import os
 import re
-from typing import List, Dict, Tuple, Optional
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 
-def _tokenize(text: str) -> List[str]:
-  # Simple, library-free tokenizer
-  cleaned = []
-  for ch in text.lower():
-    if ch.isalnum() or ch in {" ", "-"}:
-      cleaned.append(ch)
-    else:
-      cleaned.append(" ")
-  return [w for w in "".join(cleaned).split() if w]
+_GEMINI_API_HOST = "https://generativelanguage.googleapis.com"
+_DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+_DEFAULT_GEMINI_API_VERSION = "v1"
 
 
-def _filler_and_stopwords() -> Tuple[set[str], set[str]]:
-  # Small, hand-curated Indonesian filler/stopword lists.
-  # Keep them short and high-signal to stay deterministic and maintainable.
-  filler = {
-    "eee", "ee", "eh", "em", "umm", "hmm", "nah", "oke", "ok", "ya", "yah",
-    "anu", "gitu", "gini", "kayak", "kaya", "nih", "sih", "deh", "dong", "kan",
-    "aja", "lah", "loh", "lho", "tau", "tahu", "maksudnya",
-  }
-  stop = {
-    "yang", "dan", "atau", "di", "ke", "dari", "untuk", "pada", "itu", "ini", "nya",
-    "saya", "aku", "kita", "kami", "kamu", "lu", "gue", "dia", "mereka",
-    "jadi", "terus", "lalu", "kemudian", "nah", "oke", "karena", "sebab", "biar",
-    "dengan", "dalam", "sebagai", "adalah", "ialah", "akan", "sudah", "udah", "belum",
-    "bisa", "nggak", "tidak", "ga", "gak", "pun", "kok", "juga", "aja", "lagi",
-  }
-  return filler, stop
+def select_highlights_with_gemini(
+  transcript: List[Dict[str, Any]],
+  *,
+  api_key: Optional[str] = None,
+  model: Optional[str] = None,
+  timeout_s: float = 60.0,
+) -> List[Dict[str, Any]]:
+  """Ask Gemini to select the best 10–30s highlight clips.
 
-
-def _is_punchline(text: str) -> bool:
-  """High-precision punchline detector.
-
-  Editorial intent: pick standalone, clip-ready takes (hard advice/opinion/emotional spike)
-  even if not fully explained.
+  Safeguards:
+  - One Gemini request per transcript
+  - No retries / no multi-step chaining
+  - Returns [] on any error
+  - Ignores malformed/invalid highlight entries
   """
-  t = (text or "").strip().lower()
-  if not t:
-    return False
-
-  words = _tokenize(t)
-  n = len(words)
-  if n < 5 or n > 12:
-    return False
-
-  strong_openers = (
-    "masalahnya", "kenyataannya", "faktanya", "intinya", "kuncinya",
-  )
-  absolute_language = {
-    "selalu", "kebanyakan", "semua", "pasti", "cuma", "hanya", "satu-satunya",
-    "never", "nggak", "tidak", "gak", "ga",
-  }
-  polar_phrases = (
-    "tidak pernah", "nggak pernah", "gak pernah",
-  )
-  punch_verbs = {"harus", "wajib", "jangan", "berhenti", "fokus", "ingat"}
-
-  has_opener = t.startswith(strong_openers)
-  has_absolute = any(w in absolute_language for w in words) or any(p in t for p in polar_phrases)
-  has_take = any(w in punch_verbs for w in words)
-  has_emotion = _emotional_signal_score(t)[0] > 0
-
-  # High precision: require a short statement AND at least one punchy signal.
-  return has_opener or has_absolute or has_take or has_emotion
-
-
-def _quantile(values: List[int], q: float) -> float:
-  """Deterministic quantile for small lists (no external deps)."""
-  if not values:
-    return 0.0
-  xs = sorted(values)
-  if len(xs) == 1:
-    return float(xs[0])
-  q = max(0.0, min(1.0, q))
-  pos = (len(xs) - 1) * q
-  lo = int(pos)
-  hi = min(len(xs) - 1, lo + 1)
-  frac = pos - lo
-  return xs[lo] * (1.0 - frac) + xs[hi] * frac
-
-
-def _adaptive_peak_threshold(seg_scores: List[int]) -> int:
-  """Adaptive threshold so flat transcripts still yield highlights, while spiky ones remain selective."""
-  if not seg_scores:
-    return 2
-  p75 = _quantile(seg_scores, 0.75)
-  p50 = _quantile(seg_scores, 0.50)
-  # Base threshold near upper quartile, but not too strict.
-  thr = int(round(max(2.0, min(6.0, p75))))
-  # If distribution is flat (p75 close to median), lower slightly.
-  if (p75 - p50) < 1.0:
-    thr = max(2, thr - 1)
-  return thr
-
-
-def _claim_completeness_bonus(text: str) -> Tuple[int, Optional[str]]:
-  """Small bonus if a clip contains a claim + a brief support marker.
-
-  Why: human-curated clips often include a point + a quick justification.
-  """
-  t = text.strip().lower()
-  toks = _tokenize(t)
-  claim = {"kunci", "kuncinya", "intinya", "penting", "masalah", "solusi", "harus", "wajib", "jangan"}
-  support = {"karena", "sebab", "soalnya", "makanya", "jadi", "biar", "supaya"}
-  has_claim = any(w in claim for w in toks) or any(re.search(p, t) for p in [r"\bkunci(nya)?\b", r"\bintinya\b", r"\bmasalah\b", r"\bsolusi\b"])
-  has_support = any(w in support for w in toks)
-  if has_claim and has_support:
-    return 1, "Claim+support"
-  return 0, None
-
-
-def _window_emotion_bonus(transcript: List[Dict], l: int, r: int) -> Tuple[int, Optional[str]]:
-  """Small bonus if emotion appears across multiple segments inside the window.
-
-  Why: sustained emotion/urgency tends to produce better clips.
-  """
-  hits = 0
-  for i in range(l, r + 1):
-    em_score, _ = _emotional_signal_score(str(transcript[i].get("text", "")))
-    if em_score > 0:
-      hits += 1
-      if hits >= 2:
-        return 1, "Emotion sustained"
-  return 0, None
-
-
-def _compress_reasons(reasons: List[str], limit: int = 3) -> List[str]:
-  """Deduplicate and keep the most meaningful reasons.
-
-  Why: editorial output should be readable (2–3 concise reasons).
-  """
-  if not reasons:
+  if not isinstance(transcript, list) or not transcript:
     return []
-  seen = set()
-  deduped: List[str] = []
-  for r in reasons:
-    r = r.strip()
-    if not r:
-      continue
-    key = r.lower()
-    if key in seen:
-      continue
-    seen.add(key)
-    deduped.append(r)
 
-  priority = [
-    "Punchline",
-    "Pernyataan deklaratif kuat",
-    "Claim+support",
-    "Meaning density tinggi",
-    "Sinyal urgensi/risiko",
-    "Sinyal gagal/frustrasi",
-    "Sinyal sukses/lega",
-    "Nada tegas",
-    "Durasi",
-    "Mengandung kata kunci kuat",
-    "Panjang kalimat ideal (8–25 kata)",
-  ]
-
-  picked: List[str] = []
-  for p in priority:
-    for r in deduped:
-      if r == p or r.startswith(p):
-        if r not in picked:
-          picked.append(r)
-          if len(picked) >= limit:
-            return picked
-
-  for r in deduped:
-    if len(picked) >= limit:
-      break
-    if r not in picked:
-      picked.append(r)
-  return picked
-
-
-def _clamp_clip_length(start: float, end: float, max_len: float = 60.0) -> Tuple[float, float]:
-  """Ensure clip length never exceeds max_len seconds."""
-  if end <= start:
-    return start, start + 1.0
-  if (end - start) > max_len:
-    return start, start + max_len
-  return start, end
-
-
-def _dynamic_window_profile(anchor_text: str) -> Dict[str, float]:
-  """Pick window sizing based on the anchor's 'topic' (category) + punchiness.
-
-  Editorial intent:
-  - punchline: short & tight
-  - explanation: can breathe (but still <= 60s)
-  - insight/motivational: medium
-  """
-  if _is_punchline(anchor_text):
-    return {
-      "min_duration": 10.0,
-      "max_duration": 18.0,
-      "pre_roll": 0.7,
-      "post_roll": 1.3,
-      "max_pre_context": 5.0,
-      "max_post_context": 6.0,
-    }
-
-  cat = _classify(anchor_text)
-  if cat == "explanation":
-    return {
-      "min_duration": 22.0,
-      "max_duration": 55.0,
-      "pre_roll": 1.0,
-      "post_roll": 1.6,
-      "max_pre_context": 10.0,
-      "max_post_context": 15.0,
-    }
-  if cat == "insight":
-    return {
-      "min_duration": 16.0,
-      "max_duration": 40.0,
-      "pre_roll": 0.9,
-      "post_roll": 1.5,
-      "max_pre_context": 8.0,
-      "max_post_context": 12.0,
-    }
-  # motivational / general
-  return {
-    "min_duration": 14.0,
-    "max_duration": 35.0,
-    "pre_roll": 0.9,
-    "post_roll": 1.5,
-    "max_pre_context": 7.0,
-    "max_post_context": 10.0,
-  }
-
-
-def _meaning_density_score(text: str) -> Tuple[int, List[str]]:
-  words = _tokenize(text)
-  if not words:
-    return -3, ["Tidak ada kata"]
-
-  filler, stop = _filler_and_stopwords()
-  total = len(words)
-  filler_count = sum(1 for w in words if w in filler)
-  stop_count = sum(1 for w in words if w in stop)
-  content_words = [w for w in words if (w not in filler and w not in stop)]
-
-  content = len(content_words)
-  filler_ratio = filler_count / total
-  content_ratio = content / total
-  unique_content = len(set(content_words))
-  unique_ratio = (unique_content / max(1, content))
-
-  score = 0
-  reasons: List[str] = []
-
-  # Penalize filler-heavy text (low meaning density)
-  if filler_ratio >= 0.35:
-    score -= 3
-    reasons.append("Banyak filler")
-  elif filler_ratio >= 0.22:
-    score -= 2
-    reasons.append("Cukup banyak filler")
-
-  # Reward content density and lexical variety (a proxy for information density)
-  if content_ratio >= 0.55 and content >= 5:
-    score += 2
-    reasons.append("Meaning density tinggi")
-  elif content_ratio >= 0.45 and content >= 4:
-    score += 1
-    reasons.append("Meaning density cukup")
-
-  if unique_ratio >= 0.75 and content >= 6:
-    score += 1
-    reasons.append("Konten variatif")
-
-  # Very stopword-dominant sentences tend to be low value.
-  # Guard: don't over-penalize strong declarative claims.
-  decl_score, _ = _statement_quality_score(text)
-  if stop_count / total >= 0.70 and decl_score <= 0:
-    score -= 2
-    reasons.append("Terlalu banyak stopword")
-
-  return score, reasons
-
-
-def _statement_quality_score(text: str) -> Tuple[int, List[str]]:
-  t = text.strip().lower()
-  words = _tokenize(t)
-  score = 0
-  reasons: List[str] = []
-
-  # Strong declarative patterns (editor-friendly)
-  declarative_patterns = [
-    r"\bkunci(nya)?\s+(itu\s+)?adalah\b",
-    r"\bintinya\s+(itu\s+)?\b",
-    r"\bartinya\s+\b",
-    r"\byang\s+terjadi\s+(itu\s+)?adalah\b",
-    r"\bpoin(nya)?\s+(itu\s+)?\b",
-    r"\bpelajaran(nya)?\s+(itu\s+)?\b",
-    r"\bmasalah\s+utamanya\s+(itu\s+)?\b",
-    r"\bsolusi(nya)?\s+(itu\s+)?\b",
-  ]
-  is_declarative = any(re.search(pat, t) for pat in declarative_patterns)
-  if is_declarative:
-    score += 3
-    reasons.append("Pernyataan deklaratif kuat")
-
-  # Penalize storytelling fragments / connectors without a clear claim
-  storytelling_markers = {
-    "waktu", "dulu", "pas", "kemarin", "terus", "lalu", "kemudian",
-    "jadi", "nah", "oke",
-  }
-  has_story = any(w in storytelling_markers for w in words)
-  has_claim = any(w in {"kunci", "penting", "masalah", "solusi", "harus", "jangan", "intinya", "artinya"} for w in words)
-  # Guard: if declarative, avoid storytelling penalty.
-  if (not is_declarative) and has_story and not has_claim and len(words) >= 8:
-    score -= 2
-    reasons.append("Cenderung storytelling/filler")
-
-  # Reward assertive modality (signals a claim, advice, or lesson)
-  if any(w in {"harus", "wajib", "jangan", "pastikan", "ingat", "fokus"} for w in words):
-    score += 1
-    reasons.append("Nada tegas")
-
-  return score, reasons
-
-
-def _emotional_signal_score(text: str) -> Tuple[int, List[str]]:
-  words = _tokenize(text)
-  if not words:
-    return 0, []
-
-  # Emotion lexicon: keep small, high-precision.
-  fear_urgency = {
-    "takut", "khawatir", "cemas", "panik", "bahaya", "ancam", "darurat", "segera", "urgent", "krusial",
-    "parah", "fatal", "berisiko", "resiko", "hancur",
-  }
-  success_relief = {
-    "berhasil", "sukses", "menang", "naik", "tembus", "lega", "akhirnya", "tenang", "selamat",
-  }
-  failure_frustration = {
-    "gagal", "kecewa", "frustrasi", "capek", "lelah", "stress", "stres", "marah", "kesal", "kacau",
-    "susah", "sulit", "berantakan", "nyesel", "menyerah",
-  }
-
-  score = 0
-  reasons: List[str] = []
-
-  if any(w in fear_urgency for w in words):
-    score += 2
-    reasons.append("Sinyal urgensi/risiko")
-  if any(w in success_relief for w in words):
-    score += 1
-    reasons.append("Sinyal sukses/lega")
-  if any(w in failure_frustration for w in words):
-    score += 1
-    reasons.append("Sinyal gagal/frustrasi")
-
-  # Exclamation often indicates emphasis (but keep small)
-  if "!" in text:
-    score += 1
-    reasons.append("Penekanan emosional")
-
-  return score, reasons
-
-
-def _score_text(text: str) -> Tuple[int, List[str]]:
-  words = _tokenize(text)
-  n = len(words)
-  score = 0
-  reasons: List[str] = []
-
-  is_punch = _is_punchline(text)
-
-  strong_keywords = {
-    "penting", "kunci", "masalah", "solusi", "harus", "wajib",
-    "jangan", "selalu", "fokus", "target", "tujuan", "nilai",
-    "sukses", "gagal", "kesalahan", "intinya", "sebenarnya",
-  }
-  emphasis_starts = [
-    "jadi", "intinya", "yang paling", "ingat", "sebenarnya", "singkatnya",
-  ]
-  first_person = {"saya", "aku", "kita", "kami", "gue"}
-  question_starts = {"apa", "mengapa", "kenapa", "bagaimana", "kapan", "dimana", "berapa"}
-
-  # Length-based scoring
-  if 8 <= n <= 25:
-    score += 2
-    reasons.append("Panjang kalimat ideal (8–25 kata)")
-  elif (n < 5 or n > 30) and (not is_punch):
-    score -= 3
-    reasons.append("Terlalu pendek/terlalu panjang")
-
-  # Editorial: short punchlines should not be penalized.
-  if is_punch and 5 <= n <= 12:
-    score += 1
-    reasons.append("Punchline")
-
-  # Strong keywords
-  if any(w in strong_keywords for w in words):
-    score += 2
-    reasons.append("Mengandung kata kunci kuat")
-
-  # Emphasis start
-  lowered = text.strip().lower()
-  if any(lowered.startswith(prefix) for prefix in emphasis_starts):
-    score += 2
-    reasons.append("Awalan penekanan")
-
-  # First-person insight
-  if any(w in first_person for w in words):
-    score += 1
-    reasons.append("Insight orang pertama")
-
-  # Question penalty
-  if "?" in text or any(lowered.startswith(q) for q in question_starts):
-    score -= 2
-    reasons.append("Kalimat tanya")
-
-  # Meaning density (concise, information-dense statements win)
-  md_score, md_reasons = _meaning_density_score(text)
-  score += md_score
-  reasons.extend(md_reasons)
-
-  # Sentence quality (strong declarative claims win)
-  sq_score, sq_reasons = _statement_quality_score(text)
-  score += sq_score
-  reasons.extend(sq_reasons)
-
-  # Emotional signal (highlights often have emotion/urgency)
-  em_score, em_reasons = _emotional_signal_score(text)
-  score += em_score
-  reasons.extend(em_reasons)
-
-  # Compress reasons for readability.
-  reasons = _compress_reasons(reasons, limit=3)
-  return score, reasons
-
-
-def _classify(text: str) -> str:
-  w = set(_tokenize(text))
-  if w & {"harus", "jangan", "semangat", "percaya", "tujuan", "sukses"}:
-    return "motivational"
-  if w & {"penting", "kunci", "masalah", "solusi", "kesalahan", "intinya", "sebenarnya"}:
-    return "insight"
-  if w & {"contoh", "misalnya", "karena", "sebab", "proses", "langkah", "artinya"}:
-    return "explanation"
-  return "general"
-
-
-def _merge_chunks(transcript: List[Dict], min_duration: float = 30.0, max_duration: float = 90.0) -> List[Dict]:
-  # Merge consecutive segments into chunks within [min_duration, max_duration]
-  n = len(transcript)
-  chunks: List[Dict] = []
-  i = 0
-  while i < n:
-    j = i
-    total = 0.0
-    # Reach minimum duration
-    while j < n and total < min_duration:
-      total += float(transcript[j]["duration"])  # type: ignore
-      j += 1
-    # Extend up to max duration
-    while j < n and total < max_duration:
-      next_d = float(transcript[j]["duration"])  # type: ignore
-      if total + next_d > max_duration:
-        break
-      total += next_d
-      j += 1
-
-    if j <= i:
-      # Safety fallback
-      j = i + 1
-
-    start = float(transcript[i]["start"])  # type: ignore
-    last = transcript[j - 1]
-    end = float(last["start"]) + float(last["duration"])  # type: ignore
-    text = " ".join(str(seg["text"]) for seg in transcript[i:j])
-
-    chunks.append({
-      "start": start,
-      "end": end,
-      "text": text,
-      "_span": (i, j),  # internal for window stride
-    })
-
-    stride = max(1, (j - i) // 2)
-    i += stride
-
-  return chunks
-
-
-def _overlap_ratio(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
-  # Intersection-over-union (IoU) for time ranges
-  inter = max(0.0, min(a_end, b_end) - max(a_start, b_start))
-  union = max(1e-9, (a_end - a_start) + (b_end - b_start) - inter)
-  return inter / union
-
-
-def _build_window_around(
-  transcript: List[Dict],
-  center_index: int,
-  min_duration: float,
-  max_duration: float,
-  pre_roll: float,
-  post_roll: float,
-  max_pre_context: float = 7.0,
-  max_post_context: float = 10.0,
-) -> Tuple[int, int, float, float]:
-  """Build a time window around a center transcript segment.
-
-  Returns (left_index, right_index, start_seconds, end_seconds).
-  """
-  n = len(transcript)
-  center_index = max(0, min(n - 1, center_index))
-  l = r = center_index
-
-  def seg_start(i: int) -> float:
-    return float(transcript[i]["start"])  # type: ignore
-
-  def seg_end(i: int) -> float:
-    return float(transcript[i]["start"]) + float(transcript[i]["duration"])  # type: ignore
-
-  anchor_start = seg_start(center_index)
-  anchor_end = seg_end(center_index)
-
-  # Expand to satisfy min_duration, but keep the clip close to the anchor.
-  while l > 0 and (seg_end(r) - seg_start(l)) < min_duration:
-    # Don't pull too far before the anchor.
-    if (anchor_start - seg_start(l - 1)) > max_pre_context:
-      break
-    l -= 1
-
-  while r < n - 1 and (seg_end(r) - seg_start(l)) < min_duration:
-    # Don't push too far after the anchor.
-    if (seg_end(r + 1) - anchor_end) > max_post_context:
-      break
-    r += 1
-
-  # Optionally expand further but keep under max_duration.
-  expanded = True
-  while expanded:
-    expanded = False
-    cur = seg_end(r) - seg_start(l)
-    if cur >= max_duration:
-      break
-
-    # Try add left then right if it fits, still respecting anchor proximity.
-    if l > 0 and (anchor_start - seg_start(l - 1)) <= max_pre_context:
-      next_cur = seg_end(r) - seg_start(l - 1)
-      if next_cur <= max_duration:
-        l -= 1
-        expanded = True
-        continue
-    if r < n - 1 and (seg_end(r + 1) - anchor_end) <= max_post_context:
-      next_cur = seg_end(r + 1) - seg_start(l)
-      if next_cur <= max_duration:
-        r += 1
-        expanded = True
-
-  start = max(0.0, seg_start(l) - pre_roll)
-  end = seg_end(r) + post_roll
-  if end <= start:
-    end = start + 1.0
-
-  # Boundary cleanup: avoid starting/ending on filler-heavy segments.
-  filler, _stop = _filler_and_stopwords()
-  filler_starts = ("jadi", "nah", "oke", "ok", "eee", "eh", "em", "hmm")
-  filler_ends = {"ya", "yah", "kan", "dong", "deh", "sih", "gitu", "gini", "nih"}
-
-  def is_filler_lead(i: int) -> bool:
-    t = str(transcript[i].get("text", "")).strip().lower()
-    if not t:
-      return True
-    # Guard: don't drop strong claims just because they start with a filler-like token.
-    if _statement_quality_score(t)[0] >= 3:
-      return False
-    if t.startswith(filler_starts):
-      return True
-    toks = _tokenize(t)
-    if len(toks) <= 2:
-      return True
-    filler_ratio = sum(1 for w in toks if w in filler) / max(1, len(toks))
-    return filler_ratio >= 0.35
-
-  def is_filler_tail(i: int) -> bool:
-    t = str(transcript[i].get("text", "")).strip().lower()
-    toks = _tokenize(t)
-    if len(toks) <= 2:
-      return True
-    # Guard: keep strong declarative endings.
-    if _statement_quality_score(t)[0] >= 3:
-      return False
-    if toks and toks[-1] in filler_ends and len(toks) <= 6:
-      return True
-    filler_ratio = sum(1 for w in toks if w in filler) / max(1, len(toks))
-    return filler_ratio >= 0.35
-
-  # Shift left boundary forward if it starts with filler, while preserving min_duration.
-  while l < r and is_filler_lead(l) and (seg_end(r) - seg_start(l + 1)) >= min_duration:
-    l += 1
-  # Shift right boundary backward if it ends with filler, while preserving min_duration.
-  while r > l and is_filler_tail(r) and (seg_end(r - 1) - seg_start(l)) >= min_duration:
-    r -= 1
-
-  start = max(0.0, seg_start(l) - pre_roll)
-  end = seg_end(r) + post_roll
-  if end <= start:
-    end = start + 1.0
-
-  return l, r, start, end
+  resolved_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+  if not resolved_key:
+    return []
+
+  resolved_model = _normalize_model_name(model or os.getenv("GEMINI_MODEL") or _DEFAULT_GEMINI_MODEL)
+
+  bounds = _transcript_time_bounds(transcript)
+  if not bounds:
+    return []
+  transcript_start, transcript_end = bounds
+
+  prompt = _build_gemini_prompt(transcript)
+
+  try:
+    raw_text = _gemini_generate_content(
+      prompt=prompt,
+      api_key=resolved_key,
+      model=resolved_model,
+      timeout_s=timeout_s,
+    )
+  except Exception as exc:
+    if _debug_enabled():
+      print(f"[highlight_ai] Gemini request failed: {exc}", file=sys.stderr)
+    return []
+
+  return _parse_highlights_from_gemini_text(
+    raw_text,
+    transcript_start=transcript_start,
+    transcript_end=transcript_end,
+  )
 
 
 def detect_highlights(transcript: list[dict]) -> list[dict]:
-  """Detect highlight candidates from transcript using heuristics.
+  """Backward-compatible wrapper used by the routes."""
+  return list(select_highlights_with_gemini(transcript))
 
-  Returns list of dicts: {start, end, score, category, reason}
+
+def _normalize_model_name(model: str) -> str:
+  """Normalize model names to something accepted by the REST endpoint.
+
+  Users often paste model IDs like `models/gemini-1.5-flash-latest`. The v1beta
+  generateContent endpoint may not accept the `-latest` aliases.
+  This keeps a single request per transcript by normalizing before calling Gemini.
   """
-  if not transcript:
+  m = (model or "").strip()
+  if not m:
+    return _DEFAULT_GEMINI_MODEL
+  if m.startswith("models/"):
+    m = m[len("models/") :]
+
+  aliases = {
+    "gemini-1.5-flash-latest": "gemini-1.5-flash",
+    "gemini-1.5-pro-latest": "gemini-1.5-pro",
+    # Gemini 1.5 IDs are no longer listed for some API keys; map to a known-good 2.x model.
+    "gemini-1.5-flash": "gemini-2.0-flash",
+  }
+  return aliases.get(m, m)
+
+
+def _build_gemini_prompt(transcript: List[Dict[str, Any]]) -> str:
+  # IMPORTANT: This prompt mirrors the user-provided template.
+  # To support very large transcripts, we pack segments to reduce repeated JSON keys.
+  # Format: [[start, duration, text], ...] (content unchanged)
+  packed = _pack_transcript(transcript)
+  transcript_json = json.dumps(packed, ensure_ascii=False, separators=(",", ":"))
+
+  return (
+    "You are a professional short-form video editor.\n\n"
+    "Given the following YouTube transcript segments (in chronological order),\n"
+    "select the BEST highlight clips for short-form video (TikTok/Reels/Shorts).\n\n"
+    "Rules:\n"
+    "- Choose 3–5 clips maximum\n"
+    "- Each clip should be between 10–30 seconds\n"
+    "- Each clip must be able to stand alone\n"
+    "- Prefer:\n"
+    "  • strong opinions\n"
+    "  • clear advice\n"
+    "  • emotional moments\n"
+    "  • punchlines\n"
+    "- Avoid:\n"
+    "  • filler\n"
+    "  • setup without payoff\n"
+    "  • technical explanations\n"
+    "  • repeated ideas\n\n"
+    "Return ONLY valid JSON in this format:\n\n"
+    "{\n"
+    "  \"highlights\": [\n"
+    "    {\n"
+    "      \"start\": number,\n"
+    "      \"end\": number,\n"
+    "      \"reason\": string\n"
+    "    }\n"
+    "  ]\n"
+    "}\n\n"
+    "Transcript (JSON; each entry is [start, duration, text]):\n"
+    f"<<<{transcript_json}>>>\n"
+  )
+
+
+def _gemini_generate_content(*, prompt: str, api_key: str, model: str, timeout_s: float) -> str:
+  api_version = str(os.getenv("GEMINI_API_VERSION") or _DEFAULT_GEMINI_API_VERSION).strip() or _DEFAULT_GEMINI_API_VERSION
+  url = f"{_GEMINI_API_HOST}/{api_version}/models/{model}:generateContent"
+  params = {"key": api_key}
+  generation_config: Dict[str, Any] = {
+    "temperature": 0.4,
+    "maxOutputTokens": 1024,
+  }
+
+  # Some endpoints reject this field (notably v1 at time of writing).
+  if api_version.startswith("v1beta"):
+    generation_config["responseMimeType"] = "application/json"
+
+  payload: Dict[str, Any] = {
+    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+    "generationConfig": generation_config,
+  }
+
+  timeout: Tuple[float, float] = (10.0, max(10.0, float(timeout_s)))
+  resp = requests.post(url, params=params, json=payload, timeout=timeout)
+  if _debug_enabled():
+    print(f"[highlight_ai] Gemini request url: {url}", file=sys.stderr)
+
+  try:
+    resp.raise_for_status()
+  except requests.HTTPError as exc:
+    body = (resp.text or "").strip()
+    if len(body) > 1000:
+      body = body[:1000] + "..."
+    raise RuntimeError(f"Gemini HTTP {resp.status_code}: {body}") from exc
+
+  data = resp.json()
+  candidates = data.get("candidates")
+  if not isinstance(candidates, list) or not candidates:
+    raise RuntimeError("Gemini returned no candidates")
+
+  cand0 = candidates[0] if isinstance(candidates[0], dict) else None
+  content = cand0.get("content") if isinstance(cand0, dict) else None
+  parts = content.get("parts") if isinstance(content, dict) else None
+  if not isinstance(parts, list) or not parts:
+    raise RuntimeError("Gemini candidate has no content parts")
+
+  part0 = parts[0] if isinstance(parts[0], dict) else None
+  text = part0.get("text") if isinstance(part0, dict) else None
+  if not isinstance(text, str) or not text.strip():
+    raise RuntimeError("Gemini returned empty text")
+  return text
+
+
+def _parse_highlights_from_gemini_text(
+  text: str,
+  *,
+  transcript_start: float,
+  transcript_end: float,
+) -> List[Dict[str, Any]]:
+  cleaned = _extract_json_object(text)
+  if cleaned is None:
+    if _debug_enabled():
+      preview = (text or "")
+      preview = preview[:500] + ("..." if len(preview) > 500 else "")
+      print(f"[highlight_ai] Gemini output did not contain a JSON object. Preview: {preview}", file=sys.stderr)
     return []
 
-  # Goal: return fewer, more "krusial" clips.
-  # Hard limit to avoid too many highlights.
-  max_results = 5
-  # Don't output only 1 highlight when there is enough material.
-  min_results = 3 if len(transcript) >= 40 else 2
-  min_results = min(min_results, max_results)
+  try:
+    obj = json.loads(cleaned)
+  except Exception as exc:
+    if _debug_enabled():
+      snippet = cleaned[:500] + ("..." if len(cleaned) > 500 else "")
+      print(f"[highlight_ai] Failed to parse Gemini JSON: {exc}. Snippet: {snippet}", file=sys.stderr)
+    return []
 
-  # 1) Score each transcript segment so we can anchor highlights more precisely.
-  seg_scores: List[int] = []
-  seg_reasons: List[List[str]] = []
-  seg_punch: List[bool] = []
+  raw = obj.get("highlights") if isinstance(obj, dict) else None
+  if not isinstance(raw, list):
+    if _debug_enabled():
+      keys = list(obj.keys()) if isinstance(obj, dict) else str(type(obj))
+      print(f"[highlight_ai] Gemini JSON missing 'highlights' list. Keys/type: {keys}", file=sys.stderr)
+    return []
 
+  out: List[Dict[str, Any]] = []
+  for item in raw:
+    if not isinstance(item, dict):
+      continue
+    start = _as_float(item.get("start"))
+    end = _as_float(item.get("end"))
+    reason = item.get("reason")
+
+    if start is None or end is None:
+      continue
+    if not isinstance(reason, str) or not reason.strip():
+      continue
+    if end <= start:
+      continue
+
+    # Validate timestamps are within transcript bounds; ignore invalid entries.
+    if start < transcript_start or end > transcript_end:
+      continue
+
+    # Enforce requested clip window (10–30 seconds).
+    dur = end - start
+    if dur < 10.0 or dur > 30.0:
+      continue
+
+    out.append({"start": float(start), "end": float(end), "reason": reason.strip()})
+
+  # Keep Gemini ordering; cap at 5 per prompt.
+  return out[:5]
+
+
+def _pack_transcript(transcript: List[Dict[str, Any]]) -> List[List[Any]]:
+  packed: List[List[Any]] = []
   for seg in transcript:
-    text = str(seg.get("text", ""))
-    s, rs = _score_text(text)
-    seg_scores.append(s)
-    seg_reasons.append(rs)
-    seg_punch.append(_is_punchline(text))
-
-  # 2) Create windows around the highest scoring segments.
-  # Window sizing is dynamic per anchor "topic", with a hard cap of 60 seconds.
-  max_clip_len = 60.0
-
-  # 2a) Anchor selection via local peak detection.
-  # A good highlight anchor is a *local max* (not just globally high).
-  n = len(transcript)
-  peak_threshold = _adaptive_peak_threshold(seg_scores)
-  peaks: List[int] = []
-  for i in range(n):
-    s = seg_scores[i]
-    # Punchline anchors may bypass the numeric threshold.
-    if (s < peak_threshold) and (not seg_punch[i]):
+    if not isinstance(seg, dict):
       continue
-    left = seg_scores[i - 1] if i - 1 >= 0 else -10**9
-    right = seg_scores[i + 1] if i + 1 < n else -10**9
-    # Local peak: not worse than neighbors, and strictly better than at least one side.
-    if s >= left and s >= right and (s > left or s > right):
-      peaks.append(i)
+    start = seg.get("start")
+    duration = seg.get("duration")
+    text = seg.get("text")
+    if text is None:
+      text = ""
+    packed.append([start, duration, str(text)])
+  return packed
 
-  # Ensure punchlines are considered even if not local maxima.
-  for i in range(n):
-    if seg_punch[i] and i not in peaks:
-      peaks.append(i)
 
-  # Fallback peaks if transcript is flat
-  if not peaks:
-    peaks = sorted(range(n), key=lambda i: seg_scores[i], reverse=True)[:max(5, min_results)]
+def _extract_json_object(text: str) -> Optional[str]:
+  if not isinstance(text, str):
+    return None
+  s = text.strip()
 
-  # Rank peaks: punchlines first, then score.
-  ranked_indices = sorted(peaks, key=lambda i: (1 if seg_punch[i] else 0, seg_scores[i]), reverse=True)
+  # Strip ```json ... ``` fences if present
+  m = re.match(r"^```(?:json)?\s*(.*?)\s*```\s*$", s, flags=re.DOTALL | re.IGNORECASE)
+  if m:
+    s = m.group(1).strip()
 
-  candidates: List[Dict] = []
-  for idx in ranked_indices:
-    # Gate: prioritize only high-quality anchors.
-    if (seg_scores[idx] < peak_threshold) and (not seg_punch[idx]):
+  if s.startswith("{") and s.endswith("}"):
+    return s
+
+  start = s.find("{")
+  end = s.rfind("}")
+  if start == -1 or end == -1 or end <= start:
+    return None
+
+  candidate = s[start:end + 1].strip()
+  if candidate.startswith("{") and candidate.endswith("}"):
+    return candidate
+  return None
+
+
+def _transcript_time_bounds(transcript: List[Dict[str, Any]]) -> Optional[Tuple[float, float]]:
+  starts: List[float] = []
+  ends: List[float] = []
+  for seg in transcript:
+    if not isinstance(seg, dict):
       continue
-
-    anchor_text = str(transcript[idx].get("text", ""))
-    prof = _dynamic_window_profile(anchor_text)
-    l, r, start, end = _build_window_around(
-      transcript,
-      idx,
-      min_duration=float(prof["min_duration"]),
-      max_duration=float(prof["max_duration"]),
-      pre_roll=float(prof["pre_roll"]),
-      post_roll=float(prof["post_roll"]),
-      max_pre_context=float(prof["max_pre_context"]),
-      max_post_context=float(prof["max_post_context"]),
-    )
-    start, end = _clamp_clip_length(start, end, max_len=max_clip_len)
-
-    # Deduplicate near-identical/overlapping windows.
-    if any(_overlap_ratio(start, end, c["start"], c["end"]) >= 0.60 for c in candidates):
+    s = _as_float(seg.get("start"))
+    d = _as_float(seg.get("duration"))
+    if s is None or d is None or d < 0:
       continue
+    starts.append(float(s))
+    ends.append(float(s + d))
+  if not starts or not ends:
+    return None
+  return (min(starts), max(ends))
 
-    window_text = " ".join(str(transcript[i].get("text", "")) for i in range(l, r + 1))
-    window_score, window_reasons = _score_text(window_text)
-    # Blend anchor strength + window coherence.
-    # Bias strong to anchor (krusial point), not surrounding filler.
-    score = int(round(0.78 * seg_scores[idx] + 0.22 * window_score))
 
-    # Editorial: punchlines should rank higher than explanatory clips.
-    if seg_punch[idx] or _is_punchline(window_text):
-      score += 2
+def _as_float(value: Any) -> Optional[float]:
+  if isinstance(value, (int, float)):
+    return float(value)
+  if isinstance(value, str):
+    try:
+      return float(value.strip())
+    except Exception:
+      return None
+  return None
 
-    # Claim completeness: small boost for point + justification.
-    cc_bonus, cc_reason = _claim_completeness_bonus(window_text)
-    score += cc_bonus
 
-    # Window-level emotional reinforcement.
-    we_bonus, we_reason = _window_emotion_bonus(transcript, l, r)
-    score += we_bonus
-
-    # Duration preference:
-    # - punchline: 10–16s
-    # - regular: 15–25s
-    # - explanation may be longer, but never > 60s
-    duration = end - start
-    duration_bonus = 0
-    if seg_punch[idx] or _is_punchline(window_text):
-      if 10.0 <= duration <= 16.0:
-        duration_bonus += 2
-      elif duration < 8.0:
-        duration_bonus -= 2
-      elif duration > 20.0:
-        duration_bonus -= 2
-    else:
-      # Allow longer clips for explanatory anchors.
-      if _classify(anchor_text) == "explanation":
-        if 25.0 <= duration <= 45.0:
-          duration_bonus += 1
-        elif duration < 18.0:
-          duration_bonus -= 1
-        elif duration > 55.0:
-          duration_bonus -= 2
-      elif 15.0 <= duration <= 25.0:
-        duration_bonus += 2
-      elif duration < 12.0:
-        duration_bonus -= 2
-      elif duration > 35.0:
-        duration_bonus -= 2
-      elif duration > 28.0:
-        duration_bonus -= 1
-    score += duration_bonus
-
-    # Require final window to still look strong.
-    # Punchlines can pass with slightly lower numeric score.
-    min_score = 2 if (seg_punch[idx] or _is_punchline(window_text)) else 3
-    if score < min_score:
-      continue
-
-    reason_bits: List[str] = []
-    if seg_punch[idx] or _is_punchline(window_text):
-      reason_bits.append("Punchline")
-    if cc_reason:
-      reason_bits.append(cc_reason)
-    if we_reason:
-      reason_bits.append(we_reason)
-    if duration_bonus:
-      reason_bits.append(f"Durasi: {duration:.0f}s")
-    # Merge with the already-compressed window reasons.
-    reason_bits.extend(window_reasons or [])
-    reason = "; ".join(_compress_reasons(reason_bits, limit=3)) if reason_bits else "Heuristik default"
-
-    candidates.append({
-      "start": start,
-      "end": end,
-      "score": score,
-      "category": _classify(window_text),
-      "reason": reason,
-      "transcript": window_text,
-    })
-
-    if len(candidates) >= max_results:
-      break
-
-  # 3) Backfill: ensure we don't end up with only 1 highlight.
-  if len(candidates) < min_results:
-    # Consider next-best indices (including non-peaks) with relaxed threshold.
-    fallback_order = sorted(range(len(transcript)), key=lambda i: seg_scores[i], reverse=True)
-    for idx in fallback_order:
-      if len(candidates) >= min_results:
-        break
-      if seg_scores[idx] < 2:
-        break
-      l, r, start, end = _build_window_around(
-        transcript,
-        idx,
-        min_duration=min_duration,
-        max_duration=max_duration,
-        pre_roll=pre_roll,
-        post_roll=post_roll,
-      )
-      if any(_overlap_ratio(start, end, c["start"], c["end"]) >= 0.60 for c in candidates):
-        continue
-      window_text = " ".join(str(transcript[i].get("text", "")) for i in range(l, r + 1))
-      window_score, _ = _score_text(window_text)
-      score = int(round(0.78 * seg_scores[idx] + 0.22 * window_score))
-      candidates.append({
-        "start": start,
-        "end": end,
-        "score": score,
-        "category": _classify(window_text),
-        "reason": "Backfill kandidat (threshold relax)",
-        "transcript": window_text,
-      })
-
-  candidates.sort(key=lambda x: (x["score"], -(x["end"] - x["start"])), reverse=True)
-
-  # Dynamic cutoff: keep only the truly top tier compared to the best highlight.
-  if candidates:
-    full = candidates[:]
-    best = full[0]["score"]
-    cutoff = max(3, best - 2)
-    filtered = [c for c in full if c["score"] >= cutoff]
-    # Don't over-filter into a single clip
-    if len(filtered) >= min_results:
-      candidates = filtered
-    else:
-      candidates = full
-
-  return candidates[:max_results]
-
-# Improve highlight detection by:
-# - Merging consecutive transcript segments
-# - Combine segments until duration reaches 30–90 seconds
-# - Score merged chunk instead of single sentence
-# - Preserve original timestamps
-
-# Do NOT:
-# - Call any external API
-# - Modify transcript data in-place
-# - Hardcode timestamps
-# - Return only one highlight
+def _debug_enabled() -> bool:
+  return str(os.getenv("HIGHLIGHT_DEBUG") or os.getenv("GEMINI_DEBUG") or "").strip() in {"1", "true", "TRUE", "yes", "YES"}

@@ -54,6 +54,53 @@ uvicorn app.main:app --reload
 ```
 > Tip: Laragon’s default MySQL user is often `root` with an empty password. Adjust the URL if you have a password.
 
+## Gemini API Key
+
+Highlight selection uses Google Gemini.
+
+Option A (recommended for local dev): `.env` file
+
+- Copy `.env.example` to `.env`
+- Set your key:
+
+```bash
+GEMINI_API_KEY=your_api_key_here
+```
+
+Option B: OS environment variable
+
+macOS/Linux:
+
+```bash
+export GEMINI_API_KEY="your_api_key_here"
+```
+
+Windows PowerShell:
+
+```powershell
+$env:GEMINI_API_KEY = "your_api_key_here"
+```
+
+Optional:
+
+```bash
+GEMINI_MODEL=gemini-2.0-flash
+```
+
+Note: available model IDs depend on your API key. If you get `404 NOT_FOUND` for a model (for example `gemini-1.5-flash`), call the API's `ListModels` to see what your key can access and pick a model that supports `generateContent` (common choices are `gemini-2.0-flash` or `gemini-2.5-flash`).
+
+If you get a model `404 NOT_FOUND`, try setting:
+
+```bash
+GEMINI_API_VERSION=v1
+```
+
+Debug (kalau hasil highlight 0):
+
+```bash
+HIGHLIGHT_DEBUG=1
+```
+
 ## Next steps
 - Wire FastAPI app and routes
 - Implement services for YouTube, transcripts, and highlighting

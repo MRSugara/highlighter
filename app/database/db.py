@@ -15,6 +15,11 @@ engine = create_async_engine(
     pool_recycle=3600,
 )
 
+
+async def dispose_engine() -> None:
+    """Dispose the async engine (useful for short-lived scripts/tests)."""
+    await engine.dispose()
+
 AsyncSessionLocal = sessionmaker(
     bind=engine,
     class_=AsyncSession,

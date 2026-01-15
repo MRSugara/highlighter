@@ -15,3 +15,5 @@ button{margin-top:.75rem;padding:.5rem 1rem;border:0;border-radius:6px;backgroun
 .highlights li{padding:.5rem 0;border-top:1px solid #eee}
 .badge{display:inline-block;margin-left:.5rem;background:#eee;color:#333;padding:.1rem .4rem;border-radius:.4rem;font-size:.8rem}
 .muted{color:#666;font-size:.9rem}
+
+.feedback-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.25rem .75rem;margin-top:.25rem}

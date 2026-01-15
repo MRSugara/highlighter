@@ -66,6 +66,56 @@
             {% if h.transcript %}
               <blockquote>{{ h.transcript }}</blockquote>
             {% endif %}
+
+            <details style="margin-top: .75rem;">
+              <summary><strong>Beri feedback (untuk belajar)</strong></summary>
+              <form class="feedback-form" data-clip-id="{{ h.clip_id if h.clip_id else (video_id ~ ':' ~ (h.start|round(1)) ~ '-' ~ (h.end|round(1))) }}">
+                <div style="margin-top: .5rem;">
+                  <label>Rating (1–10)
+                    <select name="rating" required>
+                      {% for r in range(1, 11) %}
+                        <option value="{{ r }}">{{ r }}</option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                </div>
+
+                <div style="margin-top: .5rem;">
+                  <div class="muted">Weakness</div>
+                  {% set weaknesses = [
+                    'too_short','too_long','weak_opening','weak_closing','unclear_topic','no_insight','missing_reasoning','no_takeaway','too_much_context'
+                  ] %}
+                  <div class="feedback-grid">
+                    {% for w in weaknesses %}
+                      <label><input type="checkbox" name="weaknesses" value="{{ w }}"> {{ w }}</label>
+                    {% endfor %}
+                  </div>
+                </div>
+
+                <div style="margin-top: .5rem;">
+                  <div class="muted">Strength</div>
+                  {% set strengths = [
+                    'strong_opening','clear_insight','good_duration','strong_reasoning','clear_takeaway','standalone_value','good_topic'
+                  ] %}
+                  <div class="feedback-grid">
+                    {% for s in strengths %}
+                      <label><input type="checkbox" name="strengths" value="{{ s }}"> {{ s }}</label>
+                    {% endfor %}
+                  </div>
+                </div>
+
+                <div style="margin-top: .5rem;">
+                  <label>Notes (opsional)
+                    <textarea name="notes" rows="2" placeholder="Catatan bebas (disimpan saja, tidak dipakai logika)"></textarea>
+                  </label>
+                </div>
+
+                <div style="margin-top: .5rem; display:flex; gap:.5rem; align-items:center;">
+                  <button type="submit">Kirim feedback</button>
+                  <span class="muted feedback-status" aria-live="polite"></span>
+                </div>
+              </form>
+            </details>
           </li>
         {% endfor %}
       </ul>
